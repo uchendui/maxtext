@@ -745,7 +745,17 @@ def training_loop_iteration(
 
   completed_step = step + 1
 
-  checkpointing.maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step)
+  ran_eval = (
+      eval_interval > 0
+      and step >= start_step
+      and step >= eval_start_step
+      and (step - eval_start_step) % eval_interval == 0
+  )
+  # keep_best_eval_checkpoint saves an eval step after its eval, with the eval loss, so the
+  # preservation policy can rank the checkpoint.
+  save_after_eval = ran_eval and config.keep_best_eval_checkpoint
+  if not save_after_eval:
+    checkpointing.maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step)
 
   if dump_hlo and step == (dump_step if dump_step >= 0 else start_step):
     jax.block_until_ready(state)  # Ensure compilation has finished.
@@ -757,12 +767,6 @@ def training_loop_iteration(
         all_host_upload=dump_hlo_upload_all,
     )
 
-  ran_eval = (
-      eval_interval > 0
-      and step >= start_step
-      and step >= eval_start_step
-      and (step - eval_start_step) % eval_interval == 0
-  )
   if ran_eval:
     assert eval_data_iterator
     # Explicitly reset the eval iterator and counters before starting the eval loop
@@ -773,6 +777,7 @@ def training_loop_iteration(
     max_logging.log(f"Starting eval after train step {step}")
 
     eval_step_count = 0
+    eval_total_loss, eval_total_weights = 0.0, 0.0
     last_eval_step_completion = datetime.datetime.now()
     metric_logger_instance.mark_eval_loop_start()
     # pylint: disable=not-callable
@@ -798,12 +803,22 @@ def training_loop_iteration(
       metric_logger_instance.buffer_and_write_metrics(
           eval_metrics, eval_step_count, step_time_delta=eval_step_time_delta, is_training=False
       )
+      eval_total_loss += eval_metrics["scalar"]["evaluation/total_loss"]
+      eval_total_weights += eval_metrics["scalar"]["evaluation/total_weights"]
       eval_step_count += 1
       # Stop before fetching another batch: the extra fetch would reshard a batch that
       # is never used, and the data loading hosts may already be out of data while the
       # placeholder iterators of the other hosts keep going.
       if 0 < eval_steps <= eval_step_count:
         break
+
+    if save_after_eval:
+      # The same average the metric logger reports as eval/avg_loss.
+      eval_loss = float(eval_total_loss / (eval_total_weights + EPS))
+      max_logging.log(f"Saving eval checkpoint for step {step} with eval_loss {eval_loss}")
+      checkpointing.maybe_save_checkpoint(
+          checkpoint_manager, state, config, data_iterator, step, metrics={"eval_loss": eval_loss}
+      )
 
   prof.maybe_deactivate_profiler(step, state)
 

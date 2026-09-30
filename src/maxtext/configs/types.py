@@ -375,6 +375,11 @@ class Checkpointing(BaseModel):
   async_checkpointing: bool = Field(True, description="If True, uses an asynchronous checkpointer for performance.")
   checkpoint_period: int = Field(10_000, description="The frequency (in steps) at which to save checkpoints.")
   max_num_checkpoints_to_keep: int | None = Field(None, description="Maximum number of checkpoints to keep.")
+  keep_best_eval_checkpoint: bool = Field(
+      False,
+      description="If True, every eval saves a checkpoint with its eval loss and the lowest-loss one is kept"
+      " besides the latest max_num_checkpoints_to_keep.",
+  )
   enable_single_replica_ckpt_restoring: bool = Field(
       False, description="One replica reads and broadcasts the checkpoint."
   )

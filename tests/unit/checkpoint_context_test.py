@@ -15,6 +15,7 @@
 """Unit tests for the Orbax v1 Context / policy builders."""
 
 import datetime
+import types
 import unittest
 
 from absl.testing import absltest
@@ -72,6 +73,18 @@ class TestPreservationPolicy(unittest.TestCase):
   def test_latest_n(self):
     policy = checkpoint_context.build_preservation_policy(max_to_keep=5)
     self.assertIsInstance(policy, ocp_v1.training.preservation_policies.LatestN)
+
+  def test_keep_best_eval_keeps_latest_and_lowest_loss(self):
+    policy = checkpoint_context.build_preservation_policy(max_to_keep=1, keep_best_eval=True)
+    now = datetime.datetime.now()
+    losses = {4: 0.87, 9: 0.43, 14: 0.45, 19: 0.46}
+    checkpoints = [
+        types.SimpleNamespace(step=step, time=now, metrics={"eval_loss": loss}) for step, loss in losses.items()
+    ]
+    preserve = policy.should_preserve(
+        checkpoints, context=ocp_v1.training.preservation_policies.PreservationContext()
+    )
+    self.assertEqual([c.step for c, keep in zip(checkpoints, preserve) if keep], [9, 19])
 
 
 class TestBuildContext(unittest.TestCase):

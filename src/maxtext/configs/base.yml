@@ -56,6 +56,9 @@ save_checkpoint_on_completion: true
 async_checkpointing: true
 checkpoint_period: 10_000
 max_num_checkpoints_to_keep: None
+# Every eval also saves a checkpoint with its eval loss; the checkpoint with the lowest loss is kept
+# besides the latest max_num_checkpoints_to_keep.
+keep_best_eval_checkpoint: false
 enable_continuous_checkpointing: false
 # enables one replica to read the ckpt then broadcast to the rest
 enable_single_replica_ckpt_restoring: false

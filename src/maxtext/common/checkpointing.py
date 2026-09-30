@@ -534,6 +534,7 @@ def create_orbax_checkpoint_manager(
     todelete_subdir: str | None = None,
     todelete_full_path: str | None = None,
     ocdbt_target_data_file_size_bytes: int | None = None,
+    keep_best_eval_checkpoint: bool = False,
 ):
   """Returns an Orbax v1 training ``Checkpointer``, or None if checkpointing is disabled."""
   if not enable_checkpointing:
@@ -582,6 +583,7 @@ def create_orbax_checkpoint_manager(
       ),
       preservation_policy=checkpoint_context.build_preservation_policy(
           max_to_keep=max_num_checkpoints_to_keep,
+          keep_best_eval=keep_best_eval_checkpoint,
       ),
   )
   # Necessary bridge to support v0 backward compatibility.
@@ -1202,8 +1204,12 @@ def checkpoint_exception_guard(config, checkpoint_manager, handler_fn=None):
       raise
 
 
-def maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step=None):
-  """Save checkpoint if checkpointing is enabled."""
+def maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step=None, metrics=None):
+  """Save checkpoint if checkpointing is enabled.
+
+  A save with ``metrics`` (the eval save of keep_best_eval_checkpoint) happens whatever the step, and the
+  metrics are stored with the checkpoint for the preservation policy.
+  """
   if checkpoint_manager is None:
     return
 
@@ -1223,8 +1229,9 @@ def maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step
   # AND the 'actual_step' is a valid step,
   # AND it's not a step that would normally trigger a checkpoint save.
   force_ckpt_save = step is None and actual_step != -1 and (actual_step % config.checkpoint_period != 0)
+  save_now = force_ckpt_save or metrics is not None
 
-  if not _should_save_checkpoint_at_step(checkpoint_manager, actual_step, config, force_ckpt_save):
+  if not _should_save_checkpoint_at_step(checkpoint_manager, actual_step, config, save_now):
     _handle_post_checkpoint_preemption(checkpoint_manager, actual_step, force_ckpt_save)
     return
 
@@ -1245,7 +1252,8 @@ def maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step
         state,
         config,
         data_iterator,
-        force_ckpt_save,
+        save_now,
+        metrics,
     )
   if checkpoint_saved:
     print_save_message(actual_step, config.async_checkpointing)
@@ -1283,8 +1291,8 @@ def _filter_lora_trainable_state(state):
   return _filter_dict(state)
 
 
-def save_checkpoint(checkpoint_manager, step, state, config=None, data_iterator=None, force=False):
-  """Wrapper for saving checkpoint."""
+def save_checkpoint(checkpoint_manager, step, state, config=None, data_iterator=None, force=False, metrics=None):
+  """Wrapper for saving checkpoint; ``metrics`` are stored with it for the preservation policy."""
   # Allow struct.PyTreeNode so Flax dataclass states (e.g. DiLoCoTrainState) aren't cleared to empty dicts ({})
   if not isinstance(state, (dict, nnx.State, train_state.TrainState, struct.PyTreeNode)):
     if isinstance(state, train_state_nnx.TrainStateNNX):
@@ -1353,10 +1361,12 @@ def save_checkpoint(checkpoint_manager, step, state, config=None, data_iterator=
       # the background (v0 enable_async_checkpointing parity); a None response means the
       # save decision policy declined. Background errors surface on the next save/wait.
       response = checkpoint_manager.save_checkpointables_async(
-          step, checkpointables, force=force, custom_metadata=custom_metadata
+          step, checkpointables, force=force, metrics=metrics, custom_metadata=custom_metadata
       )
       return response is not None
-    return checkpoint_manager.save_checkpointables(step, checkpointables, force=force, custom_metadata=custom_metadata)
+    return checkpoint_manager.save_checkpointables(
+        step, checkpointables, force=force, metrics=metrics, custom_metadata=custom_metadata
+    )
   except FileExistsError as e:  # ocp.training StepAlreadyExistsError subclasses FileExistsError
     max_logging.log(f"Checkpoint for step {step} already exists, skipping save. ({e})")
     return False

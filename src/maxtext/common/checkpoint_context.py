@@ -68,16 +68,28 @@ def build_save_decision_policy(
   return policies.FixedIntervalPolicy(interval=save_interval_steps)  # pyrefly: ignore[bad-return]
 
 
-def build_preservation_policy(*, max_to_keep: int) -> ocp.training.preservation_policies.PreservationPolicy:
+def build_preservation_policy(
+    *, max_to_keep: int, keep_best_eval: bool = False
+) -> ocp.training.preservation_policies.PreservationPolicy:
   """Builds the v1 PreservationPolicy (keep the latest N checkpoints).
 
   Args:
     max_to_keep: The maximum number of checkpoints to keep.
+    keep_best_eval: Also keep the checkpoint saved with the lowest ``eval_loss`` metric.
 
   Returns:
     A configured ``ocp.training.preservation_policies.PreservationPolicy``.
   """
-  return ocp.training.preservation_policies.LatestN(max_to_keep)  # pyrefly: ignore[bad-return]
+  policies = ocp.training.preservation_policies
+  latest = policies.LatestN(max_to_keep)
+  if not keep_best_eval:
+    return latest  # pyrefly: ignore[bad-return]
+  # BestN keeps the last n after sorting; reverse=True sorts descending, so the last is the lowest loss.
+  # Checkpoints saved without metrics (off-eval saves) are left to LatestN.
+  best = policies.BestN(
+      get_metric_fn=lambda metrics: metrics["eval_loss"], reverse=True, n=1, keep_checkpoints_without_metrics=False
+  )
+  return policies.AnyPreservationPolicy([latest, best])  # pyrefly: ignore[bad-return]
 
 
 def build_context(
