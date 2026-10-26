@@ -1547,8 +1547,8 @@ class HardwareAndMesh(BaseModel):
   gemma4_block_unroll: int = Field(
       -1,
       description=(
-          "Unroll of the scan over Gemma 4 decoder blocks. -1 unrolls every block; 1 keeps a loop over the blocks, "
-          "so only one block's weights are in flight at a time."
+          "Unroll of the scan over Gemma 4 decoder blocks: -1 unrolls every block into straight-line code, "
+          "1 keeps a loop over the blocks."
       ),
   )
   context_parallel_load_balance: bool = Field(True, description="Whether to use load balancing for context parallelism.")

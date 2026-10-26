@@ -2502,8 +2502,7 @@ class NNXDecoder(nnx.Module):
     # Apply the main scan over the full blocks. Gemma4ScannableBlock applies
     # per-layer remat internally (local scan + global layer), so skip the
     # block-level remat here to avoid double rematerialization.
-    # gemma4_block_unroll -1 unrolls the block loop, which lets XLA pipeline block
-    # activations across iterations at the cost of every block's weights in flight.
+    # gemma4_block_unroll -1 unrolls the block loop into straight-line code; any other value is the scan unroll.
     block_unroll = max(1, scan_length) if cfg.gemma4_block_unroll == -1 else cfg.gemma4_block_unroll
     if scan_length > 0:
       grouped_kv_caches = maxtext_utils.prepare_kv_caches_for_scan(
