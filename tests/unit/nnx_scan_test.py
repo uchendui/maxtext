@@ -14,15 +14,37 @@
 
 """Tests for NNX scan utilities."""
 
+import os
 import unittest
 from unittest import mock
 
 from flax import nnx
+from flax.linen import partitioning as nn_partitioning
 import jax
 import jax.numpy as jnp
 import numpy as np
+import yaml
 
 from maxtext.layers import nnx_scan
+from maxtext.utils.globals import MAXTEXT_CONFIGS_DIR
+
+
+class _ShardedLayer(nnx.Module):
+
+  def __init__(self, rngs: nnx.Rngs):
+    self.kernel = nnx.Param(jnp.zeros((4, 8)), sharding=("embed", "mlp"))
+
+
+class _Block(nnx.Module):
+
+  def __init__(self, rngs: nnx.Rngs):
+    self.local_layers = nnx_scan.create_scanned_layers(
+        _ShardedLayer,
+        length=2,
+        param_scan_axis=1,
+        metadata_axis_name="local_layers",
+        rngs=rngs,
+    )
 
 
 class _LinearLayer(nnx.Module):
@@ -118,6 +140,35 @@ class TestApplyScannedLayers(unittest.TestCase):
 
     checkpoint.assert_called_once()
     self.assertIsNone(checkpoint.call_args.kwargs["policy"])
+
+
+class TestScanAxisNamesHaveRules(unittest.TestCase):
+  """Every scan axis name that lands in a stacked param's `out_sharding` needs a logical axis rule.
+
+  Tunix places the optimizer state with `nnx.get_partition_spec`, and its
+  `sharding_utils.get_sharding` replicates a leaf whose spec names an axis the
+  mesh lacks. flax passes a name without a rule through unchanged, so a missing
+  rule replicates the whole kernel stack on every chip.
+  """
+
+  def test_gemma4_nested_scan_resolves_to_mesh_axes(self):
+    mesh_axes = set(yaml.safe_load(open(os.path.join(MAXTEXT_CONFIGS_DIR, "base.yml")))["mesh_axes"])
+    for config_file in ("base.yml", os.path.join("post_train", "rl.yml")):
+      with self.subTest(config_file=config_file):
+        rules = yaml.safe_load(open(os.path.join(MAXTEXT_CONFIGS_DIR, config_file)))["logical_axis_rules"]
+        with nnx.use_eager_sharding(False):
+          blocks = nnx_scan.create_scanned_layers(
+              _Block, length=3, param_scan_axis=1, metadata_axis_name="layers", rngs=nnx.Rngs(0)
+          )
+        with nn_partitioning.axis_rules([tuple(rule) for rule in rules]):
+          spec = nnx.get_partition_spec(nnx.state(blocks, nnx.Param))
+        names = {
+            name
+            for entry in spec.local_layers.kernel.value
+            for name in (entry if isinstance(entry, (tuple, list)) else (entry,))
+            if name is not None
+        }
+        self.assertTrue(names <= mesh_axes, f"{names - mesh_axes} have no mesh axis in {spec.local_layers.kernel.value}")
 
 
 if __name__ == "__main__":
