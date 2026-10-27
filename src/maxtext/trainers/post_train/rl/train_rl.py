@@ -656,11 +656,11 @@ def rl_train(argv: Sequence[str], kwargs: dict):
 def sync_rollout_weights_and_evaluate(trainer_config, rl_cluster, actor_model, test_dataset, reward_fns):
   """Loads the actor weights into the rollout engine, then runs the pre-RL evaluation when num_test_batches > 0.
 
-  The rollout engine starts with dummy weights and gets the actor weights only
-  through this sync and the syncs after each global step, so the first batches
-  would be sampled from random weights without it. Resuming from an RL
-  checkpoint needs it too: the trainer restores the checkpoint into actor_model
-  after RLCluster initializes.
+  The rollout engine already loaded the actor weights once, in its constructor
+  (maxtext_vllm_rollout.py, "initial load_checkpoint"). This sync runs after
+  RLCluster is built, so it also carries an RL checkpoint that the trainer
+  restores into actor_model after RLCluster initializes. Tunix syncs again
+  after each global step.
   """
   max_logging.log("Syncing the actor weights into the rollout engine before training.")
   rl_cluster.rollout.update_params(nnx.state(actor_model, nnx.Param))
