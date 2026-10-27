@@ -37,6 +37,7 @@ from flax import nnx
 from flax.traverse_util import flatten_dict, unflatten_dict
 import jax
 import jax.numpy as jnp
+import numpy as np
 from maxtext.integration.vllm.convert_utils import MOE_MLP_WEIGHTS, _sharding_summary
 from maxtext.integration.vllm.torchax_converter.gemma4_moe import Gemma4MaxTextToVLLMConverter
 from maxtext.integration.vllm.torchax_converter.qwen35_moe import Qwen35MaxTextToVLLMConverter
@@ -235,31 +236,33 @@ def _find_scanned_layer_idx(key_tuple, container_names=("layers", "scanned_block
   return -1, None
 
 
+def _pure_params(state):
+  if hasattr(state, "filter") and hasattr(state, "to_pure_dict"):
+    return state.filter(nnx.Param).to_pure_dict()
+  if hasattr(state, "to_pure_dict"):
+    return state.to_pure_dict()
+  if hasattr(state, "to_dict"):
+    return state.to_dict()
+  return state
+
+
+def _unwrap(state, wrapper):
+  while isinstance(state, dict) and wrapper in state:
+    state = state[wrapper]
+  return state
+
+
 def validate_direct_sync_layer_coverage(source, target) -> int:
   """Fail if an unrolled source would leave MaxText target layers untouched.
 
   Tunix intentionally intersects direct-sync trees. For heterogeneous Qwen
   scans, a schema error can therefore skip every transformer layer without an
-  exception. This check runs on the initial full-parameter load and requires
+  exception. This check runs on every direct Gemma sync and requires
   every unscanned target-layer parameter path to exist in the source.
   """
 
-  def to_pure_params(state):
-    if hasattr(state, "filter") and hasattr(state, "to_pure_dict"):
-      return state.filter(nnx.Param).to_pure_dict()
-    if hasattr(state, "to_pure_dict"):
-      return state.to_pure_dict()
-    if hasattr(state, "to_dict"):
-      return state.to_dict()
-    return state
-
-  def unwrap(state, wrapper):
-    while isinstance(state, dict) and wrapper in state:
-      state = state[wrapper]
-    return state
-
-  source = unwrap(to_pure_params(source), "base")
-  target = unwrap(to_pure_params(target), "model")
+  source = _unwrap(_pure_params(source), "base")
+  target = _unwrap(_pure_params(target), "model")
   if not isinstance(source, dict) or not isinstance(target, dict):
     return 0
 
@@ -296,6 +299,35 @@ def validate_direct_sync_layer_coverage(source, target) -> int:
       len(target_layer_keys),
   )
   return len(target_layer_keys)
+
+
+def check_layer_kernel_synced(source, target) -> None:
+  """Raises when one row of the deepest decoder layer's first kernel differs between the unrolled source and the rollout state.
+
+  Runs after the sync, so it catches a transfer that matched the keys but never reached the rollout arrays.
+  One row is enough to tell a synced kernel from the rollout's random initialization.
+  """
+  source_flat = flatten_dict(_unwrap(_pure_params(source), "base"))
+  target_flat = flatten_dict(_unwrap(_pure_params(target), "model"))
+
+  def layer_index(path):
+    for part in path:
+      match = re.fullmatch(r"layers_(\d+)", str(part))
+      if match:
+        return int(match.group(1))
+    return -1
+
+  kernels = [key for key in target_flat if key[-1] == "kernel" and layer_index(key) >= 0]
+  key = min(kernels, key=lambda k: (-layer_index(k), k))
+  expected = np.asarray(source_flat[key][0], dtype=np.float32)
+  actual = np.asarray(target_flat[key][0], dtype=np.float32)
+  path = ".".join(map(str, key))
+  if expected.shape != actual.shape or not np.array_equal(expected, actual):
+    raise ValueError(
+        f"Direct MaxText weight sync did not reach rollout kernel {path}: "
+        f"source row shape {expected.shape}, rollout row shape {actual.shape}."
+    )
+  logging.info("MaxTextVllmSampler: verified direct-sync kernel %s reached the rollout.", path)
 
 
 def _find_qwen_scanned_layer_idx(key_tuple):
@@ -389,11 +421,10 @@ def unroll_qwen_scanned_weights(weights, scan_axis: int = 1, pattern_length: Opt
 
 
 def unroll_gemma_scanned_weights(weights):
-  """Workaround for tunix unstacking bug with Gemma 3/4 scanned blocks.
+  """Unroll Gemma scanned blocks into direct decoder attributes named `layers_n`.
 
-  tunix fails to map nested layers like `layers.layers_0` to `layers_X`
-  if the target expects integer keys (as in nnx.List).
-  We manually unroll them here, keeping the keys as tuples with integers.
+  Handles the old per-slot layout and the nested local/global scan.
+  Appends remainder layers after the complete scanned blocks.
   """
   if hasattr(weights, "to_pure_dict"):
     pure_dict = weights.to_pure_dict()
@@ -409,8 +440,17 @@ def unroll_gemma_scanned_weights(weights):
 
   logging.debug("MaxTextVllmSampler: First 5 keys in flat_w: %s", list(flat_w.keys())[:5])
 
-  # Check if this is actually a scanned Gemma 3/4 checkpoint
-  is_gemma_scanned = any(_find_scanned_layer_idx(k)[0] != -1 for k in flat_w)
+  nested_keys = {}
+  for k in flat_w:
+    if "dropout" in k or "rngs" in k:
+      continue
+    for i in range(len(k) - 1):
+      if k[i] in ("scanned_blocks", "layers_remainder") and k[i + 1] in ("local_layers", "global_layer"):
+        nested_keys[k] = i
+        break
+
+  # Check both the per-slot layout and the nested local/global scan.
+  is_gemma_scanned = bool(nested_keys) or any(_find_scanned_layer_idx(k)[0] != -1 for k in flat_w)
 
   if not is_gemma_scanned:
     return weights
@@ -430,11 +470,55 @@ def unroll_gemma_scanned_weights(weights):
           scan_length = max(scan_length, v.shape[1])
 
   pattern_length = max(pattern_keys) + 1 if pattern_keys else 0
+  if nested_keys:
+    num_local = 0
+    num_global = 0
+    rem_local = 0
+    rem_global = 0
+    for k, i in nested_keys.items():
+      v = flat_w[k]
+      if k[i] == "scanned_blocks":
+        scan_length = v.shape[1]
+        if k[i + 1] == "local_layers":
+          num_local = v.shape[2]
+        else:
+          num_global = 1
+      elif k[i + 1] == "local_layers":
+        rem_local = v.shape[1]
+      else:
+        rem_global = 1
+    pattern_length = num_local + num_global if scan_length else rem_local + rem_global
   logging.info("MaxTextVllmSampler: Discovered scan_length=%d, pattern_length=%d", scan_length, pattern_length)
 
   unrolled_count = 0
   for k, v in flat_w.items():
     if "dropout" in k or "rngs" in k:
+      continue
+
+    if k in nested_keys:
+      i = nested_keys[k]
+      prefix = k[:i]
+      suffix = k[i + 2 :]
+      if k[i] == "scanned_blocks":
+        if k[i + 1] == "local_layers":
+          v_unstacked = jnp.moveaxis(v, (1, 2), (0, 1))
+          for b in range(scan_length):
+            for j in range(num_local):
+              new_flat_w[prefix + (f"layers_{b * pattern_length + j}",) + suffix] = v_unstacked[b, j]
+              unrolled_count += 1
+        else:
+          v_unstacked = jnp.swapaxes(v, 1, 0)
+          for b in range(scan_length):
+            new_flat_w[prefix + (f"layers_{b * pattern_length + num_local}",) + suffix] = v_unstacked[b]
+            unrolled_count += 1
+      elif k[i + 1] == "local_layers":
+        v_unstacked = jnp.swapaxes(v, 1, 0)
+        for j in range(v.shape[1]):
+          new_flat_w[prefix + (f"layers_{scan_length * pattern_length + j}",) + suffix] = v_unstacked[j]
+          unrolled_count += 1
+      else:
+        new_flat_w[prefix + (f"layers_{scan_length * pattern_length + rem_local}",) + suffix] = v
+        unrolled_count += 1
       continue
 
     container_idx, container_name = _find_scanned_layer_idx(k)
@@ -502,8 +586,10 @@ class MaxTextVllmSampler(VllmSampler):
 
   The weight-sync implementation itself lives in `VllmSampler.update_params`
   (Tunix), which owns the KV-cache teardown/rebuild and the `state_leaves`
-  refresh that vLLM needs to actually observe new weights. This subclass only
+  refresh that vLLM needs to actually observe new weights. This subclass
   applies scanned-weight pre-unrolls for the legacy / direct-sync paths.
+  For direct Gemma sync, it checks every target layer parameter is covered
+  before the sync and verifies one layer kernel reached the rollout after it.
   """
 
   def __init__(
@@ -527,8 +613,9 @@ class MaxTextVllmSampler(VllmSampler):
     """Update the vLLM runner weights from a MaxText state tree."""
     if self._direct_maxtext_sync and self._is_gemma:
       updated_weights = unroll_gemma_scanned_weights(updated_weights)
+      validate_direct_sync_layer_coverage(updated_weights, self.transformer_state)
     try:
-      return super().update_params(updated_weights, filter_types)
+      result = super().update_params(updated_weights, filter_types)
     except BaseException:
       # A device-addressability failure here takes the whole Pathways JobSet
       # down, and the teardown races the normal exception propagation -- the
@@ -536,6 +623,9 @@ class MaxTextVllmSampler(VllmSampler):
       # logs. Force it out before re-raising.
       _log_and_flush_traceback("MaxTextVllmSampler.update_params failed")
       raise
+    if self._direct_maxtext_sync and self._is_gemma:
+      check_layer_kernel_synced(updated_weights, self.transformer_state)
+    return result
 
 
 class MaxTextVllmRollout(vllm_rollout.VllmRollout):

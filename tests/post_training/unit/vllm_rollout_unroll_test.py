@@ -23,6 +23,7 @@ import pytest
 
 from maxtext.integration.vllm.maxtext_vllm_rollout import (
     MaxTextVllmRollout,
+    MaxTextVllmSampler,
     prepare_direct_sync_additional_config,
     requires_maxtext_scanned_weight_unroll,
     unroll_gemma_scanned_weights,
@@ -31,7 +32,7 @@ from maxtext.integration.vllm.maxtext_vllm_rollout import (
     validate_direct_sync_layer_coverage,
 )
 
-from tunix.generate.vllm_sampler import VllmConfig
+from tunix.generate.vllm_sampler import VllmConfig, VllmSampler
 from tunix.rl.rollout import base_rollout
 
 pytestmark = pytest.mark.post_training
@@ -143,6 +144,35 @@ class GemmaScannedWeightsUnrollTest(unittest.TestCase):
     # Check that shared attention weight was broadcasted
     np.testing.assert_array_equal(decoder_dict["layers_0"]["attn"]["wq"], np.array([[9], [9]]))
     np.testing.assert_array_equal(decoder_dict["layers_2"]["attn"]["wq"], np.array([[9], [9]]))
+
+  def test_unrolls_nested_scan_gemma4_blocks(self):
+    local = np.zeros((1, 2, 2, 1))
+    for b in range(2):
+      for j in range(2):
+        local[:, b, j] = 10 * b + j
+    glob = np.zeros((1, 2, 1))
+    for b in range(2):
+      glob[:, b] = 10 * b + 5
+    rem_local = np.full((1, 1, 1), 20.0)
+    pure_dict = {
+        "decoder": {
+            "scanned_blocks": {
+                "local_layers": {"mlp": {"wi_0": local}},
+                "global_layer": {"mlp": {"wi_0": glob}},
+            },
+            "layers_remainder": {"local_layers": {"mlp": {"wi_0": rem_local}}},
+        }
+    }
+
+    unrolled = unroll_gemma_scanned_weights(MockWeights(pure_dict))
+
+    self.assertEqual(set(unrolled["decoder"]), {f"layers_{i}" for i in range(7)})
+    for i, value in enumerate((0, 1, 5, 10, 11, 15, 20)):
+      np.testing.assert_array_equal(unrolled["decoder"][f"layers_{i}"]["mlp"]["wi_0"], np.full((1, 1), value))
+    target = {
+        "model": {"decoder": {f"layers_{i}": {"mlp": {"wi_0": np.zeros((1, 1))}} for i in range(7)}}
+    }
+    self.assertEqual(validate_direct_sync_layer_coverage(unrolled, target), 7)
 
   def test_correctly_unrolls_gemma3_gemma4_scanned_blocks(self):
     """Verify that scanned layers under scanned_blocks are properly interleaved and mapped."""
@@ -348,6 +378,69 @@ class QwenScannedWeightsUnrollTest(unittest.TestCase):
     target = {"model": {"decoder": {"layers_0": {"mlp": {"routed_experts": {"wi": np.zeros((2, 3, 8))}}}}}}
 
     self.assertEqual(validate_direct_sync_layer_coverage(source, target), 1)
+
+
+class MaxTextVllmSamplerSyncChecksTest(unittest.TestCase):
+  """Verify direct Gemma sync covers layers and reaches the rollout arrays."""
+
+  def setUp(self):
+    with mock.patch.object(VllmSampler, "__init__", return_value=None):
+      self.sampler = MaxTextVllmSampler(
+          tokenizer=object(),
+          config=SimpleNamespace(engine_kwargs={}),
+          direct_maxtext_sync=True,
+          model_name="gemma4-31b",
+      )
+    self.target = {
+        "model": {
+            "decoder": {
+                f"layers_{i}": {"mlp": {"wi_0": {"kernel": np.zeros((2, 3))}}} for i in range(2)
+            },
+            "token_embedder": {"embedding": np.zeros((4, 2))},
+        }
+    }
+    self.source = MockWeights(
+        {
+            "base": {
+                "decoder": {
+                    "scanned_blocks": {
+                        "layers_0": {"mlp": {"wi_0": {"kernel": np.full((2, 1, 3), 1.0)}}},
+                        "layers_1": {"mlp": {"wi_0": {"kernel": np.full((2, 1, 3), 2.0)}}},
+                    }
+                },
+                "token_embedder": {"embedding": np.ones((4, 2))},
+            }
+        }
+    )
+    state_patch = mock.patch.object(
+        MaxTextVllmSampler, "transformer_state", new_callable=mock.PropertyMock, return_value=self.target
+    )
+    state_patch.start()
+    self.addCleanup(state_patch.stop)
+
+  def test_rejects_source_that_leaves_a_target_layer_uncovered(self):
+    self.target["model"]["decoder"]["layers_2"] = {"mlp": {"wi_0": {"kernel": np.zeros((2, 3))}}}
+
+    with mock.patch.object(VllmSampler, "update_params") as update_params:
+      with self.assertRaises(ValueError):
+        self.sampler.update_params(self.source)
+      update_params.assert_not_called()
+
+  def test_rejects_sync_that_does_not_reach_the_rollout(self):
+    with mock.patch.object(VllmSampler, "update_params"):
+      with self.assertRaises(ValueError):
+        self.sampler.update_params(self.source)
+
+  def test_accepts_sync_that_reaches_the_rollout(self):
+    def copy_kernels(updated_weights, filter_types):
+      for i in range(2):
+        self.target["model"]["decoder"][f"layers_{i}"]["mlp"]["wi_0"]["kernel"] = updated_weights["base"][
+            "decoder"
+        ][f"layers_{i}"]["mlp"]["wi_0"]["kernel"]
+
+    with mock.patch.object(VllmSampler, "update_params", side_effect=copy_kernels) as update_params:
+      self.sampler.update_params(self.source)
+      update_params.assert_called_once()
 
 
 class DirectSyncRolloutConfigTest(unittest.TestCase):
