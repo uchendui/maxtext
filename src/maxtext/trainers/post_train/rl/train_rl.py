@@ -448,6 +448,7 @@ def create_rl_components(  # pylint: disable=too-many-positional-arguments
           mini_batch_size=trainer_config.batch_size,
           train_micro_batch_size=train_micro_batch_size,
           rollout_micro_batch_size=rollout_micro_batch_size,
+          compute_logps_chunk_size=trainer_config.rl.compute_logps_chunk_size,
           max_seq_token_per_tpu=trainer_config.max_seq_token_per_tpu or None,
           metrics_logging_options=metrics_logging_options,
           profiler_options=profiler_options,

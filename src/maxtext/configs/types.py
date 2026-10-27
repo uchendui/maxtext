@@ -3069,6 +3069,14 @@ class RL(BaseModel):
           "If None, no chunking is applied, which may lead to OOM errors if tensors are too large."
       ),
   )
+  compute_logps_chunk_size: int = Field(
+      0,
+      ge=0,
+      description=(
+          "Tokens per chunk for the per-token log probabilities. Tunix projects the hidden states to logits one"
+          " chunk at a time instead of materializing the fp32 logits of the whole sequence. 0 disables chunking."
+      ),
+  )
   use_rollout_logps: bool = Field(
       True,
       description=(

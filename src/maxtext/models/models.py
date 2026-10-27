@@ -203,6 +203,7 @@ class Transformer(nnx.Module):
       attention_metadata: dict[str, Any] | None = None,
       forced_routed_experts: jnp.ndarray | None = None,
       decoder_input_embeddings: jax.Array | None = None,
+      skip_lm_head: bool = False,
   ):
     """Applies the Zero-1 FSDP wrapped Transformer model.
 
@@ -227,7 +228,8 @@ class Transformer(nnx.Module):
       attention_metadata: Mapping to store attention metadata, used when invoking from vLLM (optional).
 
     Returns:
-      Logits from the Transformer model. Logits, hidden_state, kv_caches if called by vLLM.
+      Logits from the Transformer model. The hidden state before the output head when skip_lm_head is True.
+      Logits, hidden_state, kv_caches if called by vLLM.
     """
     if decoder_segment_ids is not None and model_mode == MODEL_MODE_AUTOREGRESSIVE:
       raise ValueError(
@@ -286,6 +288,7 @@ class Transformer(nnx.Module):
         shared_embedding=self.token_embedder,
         decoder_input_tokens=decoder_input_tokens,
         decoder_input_embeddings=decoder_input_embeddings,
+        skip_lm_head=skip_lm_head,
         decoder_positions=decoder_positions,
         decoder_segment_ids=decoder_segment_ids,
         deterministic=not enable_dropout,
@@ -342,4 +345,6 @@ class Transformer(nnx.Module):
         return hidden_state, kv_caches, expert_indices
       return hidden_state, kv_caches
 
+    if skip_lm_head:
+      return hidden_state
     return logits

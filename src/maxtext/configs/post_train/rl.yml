@@ -69,6 +69,7 @@ rl:
   # Number of model keys to chunk for resharding tensors between trainer and rollout devices.
   # If null, the entire model is resharded at once.
   reshard_chunk_size: null
+  compute_logps_chunk_size: 0  # > 0 computes the per-token log probabilities in chunks of this many tokens
 
 # ====== Models ======
 # for MaxText

@@ -27,6 +27,7 @@ import numpy as np
 
 from tunix.rl import common as tunix_common
 
+from maxtext.common.common_types import MODEL_MODE_TRAIN
 from maxtext.integration.tunix import tunix_adapter as tunix_adapter_module
 from maxtext.integration.tunix.tunix_adapter import TunixMaxTextAdapter
 
@@ -62,15 +63,25 @@ class _CallableStubBase:
   def __init__(self):
     self.config = SimpleNamespace(model_name=_STUB_MODEL_NAME)
     self.captured = {}
+    self.token_embedder = object()
+    self.decoder = SimpleNamespace(apply_output_head=self._apply_output_head)
 
-  def __call__(self, *, decoder_input_tokens, decoder_positions, decoder_segment_ids, forced_routed_experts=None):
+  def __call__(
+      self, *, decoder_input_tokens, decoder_positions, decoder_segment_ids, forced_routed_experts=None, skip_lm_head=False
+  ):
     self.captured["decoder_input_tokens"] = decoder_input_tokens
     self.captured["decoder_positions"] = decoder_positions
     self.captured["decoder_segment_ids"] = decoder_segment_ids
     self.captured["forced_routed_experts"] = forced_routed_experts
+    self.captured["skip_lm_head"] = skip_lm_head
     # Return dummy logits shaped [B, L, V=2] so the adapter has something to forward.
     b, l = decoder_input_tokens.shape
-    return jnp.zeros((b, l, 2), dtype=jnp.float32)
+    self.captured["return_value"] = jnp.zeros((b, l, 2), dtype=jnp.float32)
+    return self.captured["return_value"]
+
+  def _apply_output_head(self, shared_embedding, y, deterministic, model_mode):
+    self.captured["apply_output_head"] = (shared_embedding, y, deterministic, model_mode)
+    return y * 2.0
 
 
 class TunixAdapterSegmentIdsTest(unittest.TestCase):
@@ -346,6 +357,50 @@ class TunixAdapterAttentionMaskTest(unittest.TestCase):
     logits, _ = jax.jit(lambda t, p, m: adapter(t, p, None, m))(self.input_tokens, self.positions, mask)
 
     self.assertEqual(logits.shape, (2, 8, 2))
+
+
+class TunixAdapterChunkedLogpsTest(unittest.TestCase):
+  """Verify Tunix's chunked per-token log-probabilities adapter contract."""
+
+  def setUp(self):
+    super().setUp()
+    weight_mapping_patcher = mock.patch.object(tunix_adapter_module, "VllmWeightMapping")
+    weight_mapping_patcher.start()
+    self.addCleanup(weight_mapping_patcher.stop)
+
+    hf_configs_patcher = mock.patch.dict(
+        tunix_adapter_module.HF_MODEL_CONFIGS,
+        {_STUB_MODEL_NAME: SimpleNamespace(to_dict=lambda: {})},
+    )
+    hf_configs_patcher.start()
+    self.addCleanup(hf_configs_patcher.stop)
+
+    self.base = _CallableStubBase()
+    self.adapter = TunixMaxTextAdapter(base_model=self.base, pad_id=_PAD)
+    self.input_tokens = jnp.array([[10, 11, 12]], dtype=jnp.int32)
+    self.positions = jnp.arange(3, dtype=jnp.int32)[None, :]
+
+  def test_skip_lm_head_is_forwarded_to_the_base(self):
+    hidden, second = self.adapter(self.input_tokens, self.positions, None, None, skip_lm_head=True)
+
+    self.assertTrue(self.base.captured["skip_lm_head"])
+    self.assertIsNone(second)
+    self.assertIs(hidden, self.base.captured["return_value"])
+
+  def test_call_signature_names_skip_lm_head_so_the_tunix_gate_passes(self):
+    self.assertTrue(tunix_common.model_call_contains(self.adapter, "skip_lm_head"))
+    self.assertTrue(callable(getattr(self.adapter, "compute_final_logits", None)))
+
+  def test_compute_final_logits_applies_the_output_head(self):
+    hidden = jnp.ones((1, 3, 2))
+    out = self.adapter.compute_final_logits(hidden)
+
+    shared_embedding, y, deterministic, model_mode = self.base.captured["apply_output_head"]
+    self.assertIs(shared_embedding, self.base.token_embedder)
+    self.assertIs(y, hidden)
+    self.assertFalse(deterministic)
+    self.assertEqual(model_mode, MODEL_MODE_TRAIN)
+    np.testing.assert_array_equal(out, hidden * 2.0)
 
 
 if __name__ == "__main__":

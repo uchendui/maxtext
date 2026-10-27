@@ -27,6 +27,7 @@ import jax.numpy as jnp
 from flax import nnx
 from jax import Array
 from maxtext.checkpoint_conversion.utils.hf_model_configs import HF_MODEL_CONFIGS  # pylint: disable=ungrouped-imports
+from maxtext.common.common_types import MODEL_MODE_TRAIN
 from maxtext.integration.tunix.utils import VllmWeightMapping
 from maxtext.models.models import Transformer
 
@@ -138,9 +139,9 @@ class TunixMaxTextAdapter(nnx.Module):
       output_hidden_states: bool = False,  # ignored
       forced_routed_experts: Optional[Array] = None,
       segment_ids: Optional[Array] = None,
+      skip_lm_head: bool = False,
   ) -> Tuple[Array, None]:
-    """Forward compatible with Tunix Trainers default loss.
-    Returns logits, None.
+    """Returns (logits, None), or (hidden states, None) when skip_lm_head is True.
 
     `segment_ids` is the name Tunix uses for packed-sequence segment ids: it
     forwards them only to models whose call signature has a parameter of that
@@ -161,8 +162,15 @@ class TunixMaxTextAdapter(nnx.Module):
         decoder_positions=positions,
         decoder_segment_ids=decoder_segment_ids,
         forced_routed_experts=forced_routed_experts,
+        skip_lm_head=skip_lm_head,
     )
     return logits, None
+
+  def compute_final_logits(self, hidden_states: Array) -> Array:
+    """Projects hidden states to logits; Tunix calls it per sequence chunk when compute_logps_chunk_size > 0."""
+    return self.base.decoder.apply_output_head(
+        self.base.token_embedder, hidden_states, deterministic=False, model_mode=MODEL_MODE_TRAIN
+    )
 
   def to_hf_mappings(self):
     if self.use_no_op_mappings:
