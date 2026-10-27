@@ -168,8 +168,10 @@ class TunixMaxTextAdapter(nnx.Module):
 
   def compute_final_logits(self, hidden_states: Array) -> Array:
     """Projects hidden states to logits; Tunix calls it per sequence chunk when compute_logps_chunk_size > 0."""
+    # Tunix runs this inside a remat scan, where dropout could not mutate its RNG, so the head
+    # runs without dropout; train_rl.py rejects chunking with a nonzero dropout_rate.
     return self.base.decoder.apply_output_head(
-        self.base.token_embedder, hidden_states, deterministic=False, model_mode=MODEL_MODE_TRAIN
+        self.base.token_embedder, hidden_states, deterministic=True, model_mode=MODEL_MODE_TRAIN
     )
 
   def to_hf_mappings(self):

@@ -398,7 +398,7 @@ class TunixAdapterChunkedLogpsTest(unittest.TestCase):
     shared_embedding, y, deterministic, model_mode = self.base.captured["apply_output_head"]
     self.assertIs(shared_embedding, self.base.token_embedder)
     self.assertIs(y, hidden)
-    self.assertFalse(deterministic)
+    self.assertTrue(deterministic)
     self.assertEqual(model_mode, MODEL_MODE_TRAIN)
     np.testing.assert_array_equal(out, hidden * 2.0)
 

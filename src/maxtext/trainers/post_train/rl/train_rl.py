@@ -424,6 +424,12 @@ def create_rl_components(  # pylint: disable=too-many-positional-arguments
     # engine shape, so unrelated engine changes can move it.
     rollout_vllm_kwargs["block_size"] = trainer_config.vllm_block_size
 
+  if trainer_config.rl.compute_logps_chunk_size > 0 and trainer_config.dropout_rate > 0:
+    raise ValueError(
+        f"compute_logps_chunk_size={trainer_config.rl.compute_logps_chunk_size} needs dropout_rate=0; the chunked"
+        f" output head runs inside a remat scan without dropout, got dropout_rate={trainer_config.dropout_rate}"
+    )
+
   cluster_config = rl_cluster_lib.ClusterConfig(
       role_to_mesh={
           rl_cluster_lib.Role.ACTOR: actor_mesh,
