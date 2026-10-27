@@ -653,6 +653,34 @@ def rl_train(argv: Sequence[str], kwargs: dict):
   _rl_train_impl(argv, kwargs)
 
 
+def sync_rollout_weights_and_evaluate(trainer_config, rl_cluster, actor_model, test_dataset, reward_fns):
+  """Loads the actor weights into the rollout engine, then runs the pre-RL evaluation when num_test_batches > 0.
+
+  The rollout engine starts with dummy weights and gets the actor weights only
+  through this sync and the syncs after each global step, so the first batches
+  would be sampled from random weights without it. Resuming from an RL
+  checkpoint needs it too: the trainer restores the checkpoint into actor_model
+  after RLCluster initializes.
+  """
+  max_logging.log("Syncing the actor weights into the rollout engine before training.")
+  rl_cluster.rollout.update_params(nnx.state(actor_model, nnx.Param))
+
+  if trainer_config.num_test_batches > 0:
+    (corr, total, accuracy, partial_accuracy, format_accuracy, mean_reward), _ = evaluate(
+        trainer_config,
+        test_dataset,
+        rl_cluster=rl_cluster,
+        num_passes=trainer_config.num_eval_passes,
+        corr_lst=trainer_config.eval_corr_lst,
+        make_lst=trainer_config.eval_make_lst,
+        reward_fns=reward_fns,
+    )
+    max_logging.warning(
+        f"Pre RL Training: {corr=}, {total=}, {accuracy=}%, {partial_accuracy=}%,"
+        f" {format_accuracy=}%, {mean_reward=:.4f}"
+    )
+
+
 def _rl_train_impl(argv: Sequence[str], kwargs: dict):
   """rl_train execution body."""
   trainer_config, sampler_config, trainer_devices, sampler_devices = model_creation_utils.setup_configs_and_devices(
@@ -728,29 +756,7 @@ def _rl_train_impl(argv: Sequence[str], kwargs: dict):
       model_tokenizer,
   )
 
-  # Run evaluation before training
-  if trainer_config.num_test_batches > 0:
-    # Explicitly sync actor model weights to the rollout engine before Pre-RL evaluation.
-    # When resuming from an RL checkpoint (step > 0), the trainer restores RL checkpoint
-    # weights into actor_model after RLCluster initializes. Without this explicit sync,
-    # the rollout engine would evaluate using the base HuggingFace/SFT weights instead of
-    # the restored RL checkpoint weights. Calling this unconditionally ensures weight sync
-    # robustness across all initialization and restore workflows.
-    rl_cluster.rollout.update_params(nnx.state(actor_model, nnx.Param))
-
-    (corr, total, accuracy, partial_accuracy, format_accuracy, mean_reward), _ = evaluate(
-        trainer_config,
-        test_dataset,
-        rl_cluster=rl_cluster,
-        num_passes=trainer_config.num_eval_passes,
-        corr_lst=trainer_config.eval_corr_lst,
-        make_lst=trainer_config.eval_make_lst,
-        reward_fns=reward_fns,
-    )
-    max_logging.warning(
-        f"Pre RL Training: {corr=}, {total=}, {accuracy=}%, {partial_accuracy=}%,"
-        f" {format_accuracy=}%, {mean_reward=:.4f}"
-    )
+  sync_rollout_weights_and_evaluate(trainer_config, rl_cluster, actor_model, test_dataset, reward_fns)
 
   # Start training
   if trainer_config.load_checkpoint_only_once:

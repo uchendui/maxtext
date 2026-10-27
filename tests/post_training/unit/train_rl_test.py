@@ -30,6 +30,8 @@ import numpy as np
 import pytest
 from types import SimpleNamespace
 import jax
+import jax.numpy as jnp
+from flax import nnx
 
 from maxtext.trainers.post_train.rl import train_rl
 from maxtext.trainers.post_train.rl import utils_rl
@@ -54,6 +56,41 @@ def _get_mock_devices(devices_per_slice, num_slices=1):
       d.slice_index = slice_idx
       mock_devices.append(d)
   return mock_devices
+
+
+class _Actor(nnx.Module):
+
+  def __init__(self):
+    self.w = nnx.Param(jnp.ones((2,)))
+
+
+class SyncRolloutWeightsTest(unittest.TestCase):
+  """The actor weights reach the rollout engine before training, with or without the pre-RL evaluation."""
+
+  def _run(self, num_test_batches):
+    rollout = mock.Mock()
+    rl_cluster = SimpleNamespace(rollout=rollout)
+    trainer_config = SimpleNamespace(
+        num_test_batches=num_test_batches,
+        num_eval_passes=1,
+        eval_corr_lst=False,
+        eval_make_lst=False,
+    )
+    with mock.patch.object(train_rl, "evaluate", return_value=((0, 0, 0.0, 0.0, 0.0, 0.0), None)) as evaluate:
+      train_rl.sync_rollout_weights_and_evaluate(
+          trainer_config, rl_cluster, _Actor(), test_dataset=object(), reward_fns=[]
+      )
+    return rollout, evaluate
+
+  def test_syncs_without_the_pre_rl_evaluation(self):
+    rollout, evaluate = self._run(num_test_batches=0)
+    rollout.update_params.assert_called_once()
+    evaluate.assert_not_called()
+
+  def test_syncs_before_the_pre_rl_evaluation(self):
+    rollout, evaluate = self._run(num_test_batches=2)
+    rollout.update_params.assert_called_once()
+    evaluate.assert_called_once()
 
 
 class TrainRLTest(unittest.TestCase):
