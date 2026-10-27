@@ -29,7 +29,7 @@ from maxtext.integration.vllm.maxtext_vllm_rollout import (
     unroll_gemma_scanned_weights,
     unroll_qwen_scanned_weights,
     uses_maxtext_vllm_adapter,
-    validate_direct_sync_layer_coverage,
+    validate_direct_sync_coverage,
 )
 
 from tunix.generate.vllm_sampler import VllmConfig, VllmSampler
@@ -172,7 +172,27 @@ class GemmaScannedWeightsUnrollTest(unittest.TestCase):
     target = {
         "model": {"decoder": {f"layers_{i}": {"mlp": {"wi_0": np.zeros((1, 1))}} for i in range(7)}}
     }
-    self.assertEqual(validate_direct_sync_layer_coverage(unrolled, target), 7)
+    self.assertEqual(validate_direct_sync_coverage(unrolled, target), 7)
+
+  def test_unrolls_nested_scan_gemma4_blocks_on_axis_0(self):
+    local = np.array([[[0.0], [1.0]], [[10.0], [11.0]]])
+    glob = np.array([[5.0], [15.0]])
+    rem_local = np.array([[20.0]])
+    pure_dict = {
+        "decoder": {
+            "scanned_blocks": {
+                "local_layers": {"mlp": {"wi_0": local}},
+                "global_layer": {"mlp": {"wi_0": glob}},
+            },
+            "layers_remainder": {"local_layers": {"mlp": {"wi_0": rem_local}}},
+        }
+    }
+
+    unrolled = unroll_gemma_scanned_weights(MockWeights(pure_dict), scan_axis=0)
+
+    self.assertEqual(set(unrolled["decoder"]), {f"layers_{i}" for i in range(7)})
+    for i, value in enumerate((0, 1, 5, 10, 11, 15, 20)):
+      np.testing.assert_array_equal(unrolled["decoder"][f"layers_{i}"]["mlp"]["wi_0"], np.full((1,), value))
 
   def test_correctly_unrolls_gemma3_gemma4_scanned_blocks(self):
     """Verify that scanned layers under scanned_blocks are properly interleaved and mapped."""
@@ -256,7 +276,7 @@ class QwenScannedWeightsUnrollTest(unittest.TestCase):
             "decoder": {f"layers_{layer_idx}": {"probe": np.zeros((2, 1), dtype=np.float32)} for layer_idx in range(4)}
         }
     }
-    self.assertEqual(validate_direct_sync_layer_coverage(unrolled, target), 4)
+    self.assertEqual(validate_direct_sync_coverage(unrolled, target), 4)
 
   @pytest.mark.cpu_only
   def test_correctly_unrolls_homogeneous_scanned_weights(self):
@@ -297,7 +317,7 @@ class QwenScannedWeightsUnrollTest(unittest.TestCase):
             }
         }
     }
-    self.assertEqual(validate_direct_sync_layer_coverage(unrolled, target), 4)
+    self.assertEqual(validate_direct_sync_coverage(unrolled, target), 4)
 
   @pytest.mark.cpu_only
   def test_rejects_inconsistent_scan_lengths(self):
@@ -349,15 +369,28 @@ class QwenScannedWeightsUnrollTest(unittest.TestCase):
     }
 
     with self.assertRaisesRegex(ValueError, "leave rollout transformer parameters at random initialization"):
-      validate_direct_sync_layer_coverage(source, target)
+      validate_direct_sync_coverage(source, target)
+
+  @pytest.mark.cpu_only
+  def test_rejects_missing_non_layer_target_parameters(self):
+    source = {"base": {"decoder": {"layers_0": {"probe": np.ones((2, 1))}}}}
+    target = {
+        "model": {
+            "decoder": {"layers_0": {"probe": np.zeros((2, 1))}},
+            "token_embedder": {"embedding": np.zeros((4, 2))},
+        }
+    }
+
+    with self.assertRaises(ValueError):
+      validate_direct_sync_coverage(source, target)
 
   @pytest.mark.cpu_only
   def test_rejects_source_without_unrolled_layers(self):
     source = {"base": {"decoder": {"layers": {"layer_0": {"probe": np.ones((2, 1))}}}}}
     target = {"model": {"decoder": {"layers_0": {"probe": np.zeros((2, 1))}}}}
 
-    with self.assertRaisesRegex(ValueError, "matched 0/1 target layer parameters"):
-      validate_direct_sync_layer_coverage(source, target)
+    with self.assertRaisesRegex(ValueError, "matched 0/1 target parameters"):
+      validate_direct_sync_coverage(source, target)
 
   @pytest.mark.cpu_only
   def test_accepts_split_moe_weights_for_prefused_target(self):
@@ -377,7 +410,7 @@ class QwenScannedWeightsUnrollTest(unittest.TestCase):
     }
     target = {"model": {"decoder": {"layers_0": {"mlp": {"routed_experts": {"wi": np.zeros((2, 3, 8))}}}}}}
 
-    self.assertEqual(validate_direct_sync_layer_coverage(source, target), 1)
+    self.assertEqual(validate_direct_sync_coverage(source, target), 1)
 
 
 class MaxTextVllmSamplerSyncChecksTest(unittest.TestCase):
@@ -559,7 +592,14 @@ class MaxTextVllmRolloutConfigForwardingTest(unittest.TestCase):
           maxtext_config=maxtext_config,
       )
 
-    return sampler_cls.call_args.kwargs["config"], fake_sampler
+    self.sampler_kwargs = sampler_cls.call_args.kwargs
+    return self.sampler_kwargs["config"], fake_sampler
+
+  @pytest.mark.cpu_only
+  def test_forwards_scan_axis(self):
+    self._build_vllm_config()
+
+    self.assertEqual(self.sampler_kwargs["scan_axis"], 1)
 
   @pytest.mark.cpu_only
   def test_forwards_sampling_parallelism_and_capacity_options(self):

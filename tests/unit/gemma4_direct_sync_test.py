@@ -26,7 +26,7 @@ from tunix.generate import utils as tunix_utils
 from maxtext.configs import pyconfig
 from maxtext.integration.vllm.maxtext_vllm_rollout import (
     unroll_gemma_scanned_weights,
-    validate_direct_sync_layer_coverage,
+    validate_direct_sync_coverage,
 )
 from maxtext.models import models
 from maxtext.utils import maxtext_utils
@@ -87,7 +87,7 @@ class Gemma4DirectSyncTest(unittest.TestCase):
         delete_dst_buffers=False,
     )
 
-    self.assertEqual(validate_direct_sync_layer_coverage(source, target), 178)
+    self.assertEqual(validate_direct_sync_coverage(source, target), 180)
     for path, value in flatten_dict(target.to_pure_dict()).items():
       for i, name in enumerate(path):
         if isinstance(name, str) and name.startswith("layers_"):

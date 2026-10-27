@@ -252,13 +252,12 @@ def _unwrap(state, wrapper):
   return state
 
 
-def validate_direct_sync_layer_coverage(source, target) -> int:
-  """Fail if an unrolled source would leave MaxText target layers untouched.
+def validate_direct_sync_coverage(source, target) -> int:
+  """Require source coverage for every rollout parameter before direct sync.
 
-  Tunix intentionally intersects direct-sync trees. For heterogeneous Qwen
-  scans, a schema error can therefore skip every transformer layer without an
-  exception. This check runs on every direct Gemma sync and requires
-  every unscanned target-layer parameter path to exist in the source.
+  Tunix intentionally intersects direct-sync trees. Every target path must
+  exist in the source, except prefused `wi`, which requires both `wi_0` and
+  `wi_1`. A target without unscanned layer paths is the wrong tree.
   """
 
   source = _unwrap(_pure_params(source), "base")
@@ -272,33 +271,32 @@ def validate_direct_sync_layer_coverage(source, target) -> int:
   def is_unscanned_layer_path(path):
     return any(isinstance(part, str) and re.fullmatch(r"layers_\d+", part) for part in path)
 
-  source_layer_keys = {key for key in source_flat if is_unscanned_layer_path(key)}
   target_layer_keys = {key for key in target_flat if is_unscanned_layer_path(key)}
 
   def source_covers(target_key):
-    if target_key in source_layer_keys:
+    if target_key in source_flat:
       return True
     # Tunix fuses split training weights into the inference-only prefused
     # parameter before transfer. Treat the pair as coverage for target `wi`.
     if target_key and target_key[-1] == "wi":
       prefix = target_key[:-1]
-      return prefix + ("wi_0",) in source_layer_keys and prefix + ("wi_1",) in source_layer_keys
+      return prefix + ("wi_0",) in source_flat and prefix + ("wi_1",) in source_flat
     return False
 
-  missing = {key for key in target_layer_keys if not source_covers(key)}
+  missing = {key for key in target_flat if not source_covers(key)}
   if not target_layer_keys or missing:
     examples = [".".join(map(str, key)) for key in sorted(missing)[:5]]
     raise ValueError(
         "Direct MaxText weight sync would leave rollout transformer parameters at random initialization: "
-        f"matched {len(target_layer_keys) - len(missing)}/{len(target_layer_keys)} target layer parameters; "
+        f"matched {len(target_flat) - len(missing)}/{len(target_flat)} target parameters; "
         f"missing examples: {examples}"
     )
 
   logging.info(
-      "MaxTextVllmSampler: verified direct-sync coverage for all %d rollout layer parameters.",
-      len(target_layer_keys),
+      "MaxTextVllmSampler: verified direct-sync coverage for all %d rollout parameters.",
+      len(target_flat),
   )
-  return len(target_layer_keys)
+  return len(target_flat)
 
 
 def check_layer_kernel_synced(source, target) -> None:
@@ -420,7 +418,7 @@ def unroll_qwen_scanned_weights(weights, scan_axis: int = 1, pattern_length: Opt
   return unflatten_dict(new_flat_w)
 
 
-def unroll_gemma_scanned_weights(weights):
+def unroll_gemma_scanned_weights(weights, scan_axis: int = 1):
   """Unroll Gemma scanned blocks into direct decoder attributes named `layers_n`.
 
   Handles the old per-slot layout and the nested local/global scan.
@@ -455,7 +453,7 @@ def unroll_gemma_scanned_weights(weights):
   if not is_gemma_scanned:
     return weights
 
-  logging.info("MaxTextVllmSampler: Detected Gemma scanned weights structure. Unrolling along axis 1...")
+  logging.info("MaxTextVllmSampler: Detected Gemma scanned weights structure. Unrolling along axis %d...", scan_axis)
 
   # Determine attention pattern length and scan length
   pattern_keys = set()
@@ -465,9 +463,9 @@ def unroll_gemma_scanned_weights(weights):
     if container_idx != -1 and name != "layers_remainder":
       layer_sub_idx = int(k[container_idx + 1].split("layers_")[1])
       pattern_keys.add(layer_sub_idx)
-      if hasattr(v, "shape") and len(v.shape) >= 2:
+      if hasattr(v, "shape") and len(v.shape) > scan_axis:
         if "mlp" in k and "wi_0" in k:
-          scan_length = max(scan_length, v.shape[1])
+          scan_length = max(scan_length, v.shape[scan_axis])
 
   pattern_length = max(pattern_keys) + 1 if pattern_keys else 0
   if nested_keys:
@@ -478,13 +476,13 @@ def unroll_gemma_scanned_weights(weights):
     for k, i in nested_keys.items():
       v = flat_w[k]
       if k[i] == "scanned_blocks":
-        scan_length = v.shape[1]
+        scan_length = v.shape[scan_axis]
         if k[i + 1] == "local_layers":
-          num_local = v.shape[2]
+          num_local = v.shape[scan_axis + 1]
         else:
           num_global = 1
       elif k[i + 1] == "local_layers":
-        rem_local = v.shape[1]
+        rem_local = v.shape[scan_axis]
       else:
         rem_global = 1
     pattern_length = num_local + num_global if scan_length else rem_local + rem_global
@@ -501,19 +499,19 @@ def unroll_gemma_scanned_weights(weights):
       suffix = k[i + 2 :]
       if k[i] == "scanned_blocks":
         if k[i + 1] == "local_layers":
-          v_unstacked = jnp.moveaxis(v, (1, 2), (0, 1))
+          v_unstacked = jnp.moveaxis(v, (scan_axis, scan_axis + 1), (0, 1))
           for b in range(scan_length):
             for j in range(num_local):
               new_flat_w[prefix + (f"layers_{b * pattern_length + j}",) + suffix] = v_unstacked[b, j]
               unrolled_count += 1
         else:
-          v_unstacked = jnp.swapaxes(v, 1, 0)
+          v_unstacked = jnp.swapaxes(v, scan_axis, 0)
           for b in range(scan_length):
             new_flat_w[prefix + (f"layers_{b * pattern_length + num_local}",) + suffix] = v_unstacked[b]
             unrolled_count += 1
       elif k[i + 1] == "local_layers":
-        v_unstacked = jnp.swapaxes(v, 1, 0)
-        for j in range(v.shape[1]):
+        v_unstacked = jnp.swapaxes(v, scan_axis, 0)
+        for j in range(v.shape[scan_axis]):
           new_flat_w[prefix + (f"layers_{scan_length * pattern_length + j}",) + suffix] = v_unstacked[j]
           unrolled_count += 1
       else:
@@ -528,8 +526,8 @@ def unroll_gemma_scanned_weights(weights):
       prefix = k[:container_idx]
       suffix = k[container_idx + 2 :]
 
-      if hasattr(v, "shape") and len(v.shape) >= 2 and v.shape[1] == scan_length:
-        v_swapped = jnp.swapaxes(v, 1, 0)
+      if hasattr(v, "shape") and len(v.shape) > scan_axis and v.shape[scan_axis] == scan_length:
+        v_swapped = jnp.swapaxes(v, scan_axis, 0)
         unstacked = [v_swapped[i] for i in range(scan_length)]
       else:
         unstacked = [v] * scan_length
@@ -588,7 +586,7 @@ class MaxTextVllmSampler(VllmSampler):
   (Tunix), which owns the KV-cache teardown/rebuild and the `state_leaves`
   refresh that vLLM needs to actually observe new weights. This subclass
   applies scanned-weight pre-unrolls for the legacy / direct-sync paths.
-  For direct Gemma sync, it checks every target layer parameter is covered
+  For direct Gemma sync, it checks every target parameter is covered
   before the sync and verifies one layer kernel reached the rollout after it.
   """
 
@@ -598,9 +596,11 @@ class MaxTextVllmSampler(VllmSampler):
       config: VllmConfig,
       direct_maxtext_sync: bool = False,
       model_name: Optional[str] = None,
+      scan_axis: int = 1,
   ):
     super().__init__(tokenizer=tokenizer, config=config)
     self._direct_maxtext_sync = direct_maxtext_sync
+    self._scan_axis = scan_axis
     engine_kwargs = getattr(config, "engine_kwargs", {}) or {}
     self._model_name = model_name or getattr(config, "model", "") or engine_kwargs.get("model", "") or ""
     self._is_gemma = "gemma" in str(self._model_name).lower()
@@ -612,8 +612,8 @@ class MaxTextVllmSampler(VllmSampler):
   ):
     """Update the vLLM runner weights from a MaxText state tree."""
     if self._direct_maxtext_sync and self._is_gemma:
-      updated_weights = unroll_gemma_scanned_weights(updated_weights)
-      validate_direct_sync_layer_coverage(updated_weights, self.transformer_state)
+      updated_weights = unroll_gemma_scanned_weights(updated_weights, scan_axis=self._scan_axis)
+      validate_direct_sync_coverage(updated_weights, self.transformer_state)
     try:
       result = super().update_params(updated_weights, filter_types)
     except BaseException:
@@ -754,6 +754,7 @@ class MaxTextVllmRollout(vllm_rollout.VllmRollout):
         ),
         direct_maxtext_sync=direct_maxtext_sync,
         model_name=getattr(maxtext_config, "model_name", ""),
+        scan_axis=maxtext_config.param_scan_axis,
     )
 
     # Counts every weight sync, including the initial one below. See
