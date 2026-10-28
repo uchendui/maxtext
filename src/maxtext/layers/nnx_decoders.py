@@ -2505,9 +2505,9 @@ class NNXDecoder(nnx.Module):
     attention_pattern_length = len(gemma4.GEMMA4_ATTENTION_PATTERN)
     scan_length = cfg.num_decoder_layers // attention_pattern_length
 
-    # Apply the main scan over the full blocks. Gemma4ScannableBlock applies
-    # per-layer remat internally (local scan + global layer), so skip the
-    # block-level remat here to avoid double rematerialization.
+    # Gemma4ScannableBlock applies per-layer remat inside each block, so by default the block loop adds no
+    # block-level remat. gemma4_block_remat wraps each block too: the backward pass recomputes the block's forward,
+    # and a rolled block loop keeps only each block's input.
     # gemma4_block_unroll -1 unrolls the block loop into straight-line code; any other value is the scan unroll.
     block_unroll = max(1, scan_length) if cfg.gemma4_block_unroll == -1 else cfg.gemma4_block_unroll
     if scan_length > 0:
@@ -2520,7 +2520,7 @@ class NNXDecoder(nnx.Module):
           *layer_args,
           length=scan_length,
           kv_caches_stacked=grouped_kv_caches,
-          skip_block_remat=True,
+          skip_block_remat=not cfg.gemma4_block_remat,
           unroll=block_unroll,
           **layer_kwargs,
       )

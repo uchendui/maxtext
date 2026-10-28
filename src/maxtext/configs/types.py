@@ -1551,6 +1551,13 @@ class HardwareAndMesh(BaseModel):
           "1 keeps a loop over the blocks."
       ),
   )
+  gemma4_block_remat: bool = Field(
+      False,
+      description=(
+          "Wraps each Gemma 4 decoder block of the outer block scan in jax.checkpoint with the remat policy; "
+          "with gemma4_block_unroll 1 the scan then saves only each block's input instead of every residual inside the block."
+      ),
+  )
   context_parallel_load_balance: bool = Field(True, description="Whether to use load balancing for context parallelism.")
   context_parallel_strategy: str = Field(
       "all_gather",

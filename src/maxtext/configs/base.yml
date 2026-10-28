@@ -454,6 +454,7 @@ parameter_memory_host_offload: false
 scan_layers: true
 param_scan_axis: 1
 gemma4_block_unroll: -1 # unroll of the scan over Gemma 4 decoder blocks: -1 unrolls every block into straight-line code, 1 keeps a loop over the blocks
+gemma4_block_remat: False # wraps each Gemma 4 block of the outer block scan in jax.checkpoint
 
 # The attention parameter dictates the specific algorithm/methodology used to compute the attention scores
 # The attention_type parameter determines the variants of attention, e.g. global or local_sliding
